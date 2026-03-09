@@ -5,6 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.135.1",
+    "openai>=2.26.0",
     "python-dotenv>=1.1.0",
+    "python-multipart>=0.0.22",
     "twilio>=9.8.0",
+    "websockets>=16.0",
+    "pyaudio>=0.2.14",
+    "requests>=2.31.0",
+    "uvicorn>=0.34.0",
 ]

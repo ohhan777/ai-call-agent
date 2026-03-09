@@ -104,10 +104,11 @@ def run_text_session(task: str, target_name: str) -> None:
     print("AI 전화 비서 텍스트 테스트")
     print(f"  용건: {task}")
     print(f"  상대: {target_name}")
+    print(f"  모델: {OPENAI_MODEL}")
     print("=" * 60)
 
     # 비서의 첫 인사 생성 (스트리밍)
-    opening = generate_reply_stream(client, state, "(통화 시작)")
+    opening = generate_reply_stream(client, state, "여보세요?")
     opening_clean, _ = clean_for_display(opening)
     append_turn(state, "assistant", opening_clean)
 

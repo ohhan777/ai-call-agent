@@ -1,0 +1,820 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import asyncio
+
+import requests
+import websockets
+from dotenv import load_dotenv
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from openai import OpenAI
+from twilio.twiml.voice_response import Connect, Gather, VoiceResponse
+
+load_dotenv(os.path.expanduser("~/.openclaw/.env"), override=False)
+load_dotenv(Path(__file__).with_name(".env"), override=False)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("ai_call")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+APP_DIR = Path(__file__).parent
+OUT_DIR = APP_DIR / "output" / "calls"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+TTS_DIR = APP_DIR / "output" / "tts"
+TTS_DIR.mkdir(parents=True, exist_ok=True)
+
+OPENAI_MODEL = os.getenv("OPENAI_CALL_MODEL", "gpt-5-mini")
+TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+PUBLIC_BASE_URL = os.getenv("TWILIO_PUBLIC_BASE_URL", "").rstrip("/")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+CALLER_NAME = os.getenv("CALLER_NAME", "담당자")
+CALLER_TITLE = os.getenv("CALLER_TITLE", "비서")
+
+MAX_TURNS = int(os.getenv("MAX_CALL_TURNS", "12"))
+
+# Realtime API config
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "coral")
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+app = FastAPI(title="AI Call Agent")
+
+# Serve generated TTS files at /static/tts/
+app.mount("/static/tts", StaticFiles(directory=str(TTS_DIR)), name="tts_static")
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def call_file(call_id: str) -> Path:
+    return OUT_DIR / f"{call_id}.json"
+
+
+def load_state(call_id: str) -> dict[str, Any]:
+    p = call_file(call_id)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {
+        "call_id": call_id,
+        "created_at": now_ts(),
+        "target_name": "상대방",
+        "task": "",
+        "history": [],
+        "status": "new",
+    }
+
+
+def save_state(call_id: str, state: dict[str, Any]) -> None:
+    state["updated_at"] = now_ts()
+    call_file(call_id).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def append_turn(state: dict[str, Any], role: str, text: str) -> None:
+    state.setdefault("history", []).append({"role": role, "text": text, "ts": now_ts()})
+
+
+def build_system_prompt(state: dict[str, Any]) -> str:
+    target = state.get("target_name", "상대방")
+    return (
+        f"당신은 {CALLER_NAME}님을 대신해 전화를 건 사람이다. 실제 사람처럼 자연스럽게 통화한다.\n\n"
+        "## 말투\n"
+        "- 짧고 자연스럽게. 한 번에 1~2문장.\n"
+        "- 번호 목록, 긴 나열 금지.\n"
+        "- AI 티 나는 표현 금지.\n\n"
+        "## 자기소개\n"
+        "- 상대방이 누구인지, 용건이 무엇인지에 따라 자기소개 여부를 스스로 판단한다.\n"
+        "- 음식 주문, 가게 문의 등 일반 업무 전화: 자기소개 불필요. 바로 용건을 말한다.\n"
+        "  예) '안녕하세요. 빅맥 세트 1개 포장 주문하고 싶은데요.'\n"
+        f"- {CALLER_NAME}님의 지인, 동료, 거래처 등 인간관계가 있는 상대: '{CALLER_NAME}님 {CALLER_TITLE}입니다.'로 소개한다.\n\n"
+        "## 대화 흐름\n"
+        "- 상대방이 먼저 인사하면('여보세요', '안녕하세요, OO입니다') 그에 맞춰 자연스럽게 응답하며 용건을 전달한다.\n"
+        "- 상대방이 침묵하면 내가 먼저 말을 시작한다.\n"
+        "- 상대방의 질문에는 용건 범위 내에서 바로 답한다.\n"
+        "- 모르는 내용은 '확인 후 다시 연락드리겠습니다'라고 한다.\n"
+        "- 상대가 선택지를 주면 합리적으로 선택해서 답한다.\n\n"
+        "## 종료 조건\n"
+        "- 용건이 완료되거나 상대가 거절/보류할 때만 종료한다.\n"
+        "- 종료할 때만 문장 끝에 [END_CALL]을 붙인다.\n\n"
+        f"[상대] {target}\n"
+        f"[용건]\n{state.get('task','') or '용건 미지정'}\n"
+    )
+
+
+def generate_reply(state: dict[str, Any], user_text: str) -> str:
+    normalized = re.sub(r"\s+", "", user_text)
+    if normalized in ["(음성인식실패/무응답)", "", "(무응답)"]:
+        return "말씀이 잘 안 들렸습니다. 한 번만 다시 말씀해 주시겠어요?"
+
+    system_prompt = build_system_prompt(state)
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for turn in state.get("history", [])[-20:]:
+        role = "assistant" if turn["role"] == "assistant" else "user"
+        messages.append({"role": role, "content": turn["text"]})
+    messages.append({"role": "user", "content": user_text})
+
+    t0 = time.time()
+    try:
+        resp = openai_client.with_options(timeout=12.0).chat.completions.create(
+            model=OPENAI_MODEL, messages=messages,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        elapsed = time.time() - t0
+        logger.info("[TIMING] LLM %.2fs | call=%s turns=%d | %s",
+                    elapsed, state.get("call_id", "?"), len(state.get("history", [])), text[:80])
+        return text or "네, 말씀 감사합니다."
+    except Exception as exc:
+        elapsed = time.time() - t0
+        logger.error("[TIMING] LLM FAIL %.2fs | call=%s | %s", elapsed, state.get("call_id", "?"), exc)
+        return f"네, 말씀 감사합니다. 방금 말씀해주신 내용은 {CALLER_NAME}님께 전달드리겠습니다. [END_CALL]"
+
+
+def clean_for_tts(text: str) -> tuple[str, bool]:
+    should_end = "[END_CALL]" in text
+    text = text.replace("[END_CALL]", "").strip()
+    if not text:
+        text = "감사합니다. 좋은 하루 보내세요."
+    return text, should_end
+
+
+def closing_by_local_time() -> str:
+    # User preference: fixed concise closing line.
+    return "오늘 좋은 하루 보내세요."
+
+
+def build_transcript_from_history(state: dict[str, Any]) -> str:
+    """대화 history에서 화자 분리된 전사를 생성합니다."""
+    target = state.get("target_name", "상대방")
+    lines = []
+    for turn in state.get("history", []):
+        speaker = "비서" if turn["role"] == "assistant" else target
+        lines.append(f"[{speaker}] {turn['text']}")
+    return "\n".join(lines)
+
+
+def transcribe_recording(audio_path: Path) -> str:
+    with audio_path.open("rb") as f:
+        tr = openai_client.audio.transcriptions.create(
+            model=TRANSCRIBE_MODEL,
+            file=f,
+            response_format="text",
+        )
+    return tr if isinstance(tr, str) else str(tr)
+
+
+def determine_call_outcome(state: dict[str, Any]) -> str:
+    """통화 결과를 판단합니다."""
+    if state.get("amd_result") == "machine":
+        return "voicemail"
+    status = state.get("status", "")
+    if status in ("no-answer", "busy", "failed"):
+        return status
+    history = state.get("history", [])
+    if not history:
+        return "no_conversation"
+    return "completed"
+
+
+def summarize_call(state: dict[str, Any], transcript: str) -> str:
+    history_transcript = build_transcript_from_history(state)
+    outcome = determine_call_outcome(state)
+    prompt = (
+        f"다음은 {CALLER_NAME}님의 {CALLER_TITLE}가 대리한 전화 통화 내용이다.\n"
+        f"{CALLER_NAME}님에게 보고하는 간결한 형식으로 한국어 요약해줘.\n\n"
+        "형식:\n"
+        f"## 통화 결과: {outcome}\n\n"
+        "### 목표 달성 현황\n- (용건의 각 목표별 달성 여부)\n\n"
+        "### 상대방 핵심 답변\n- (상대방이 말한 내용만, 비서 발화 제외)\n\n"
+        "### 후속 조치\n- (필요한 다음 행동)\n\n"
+        "불확실한 내용은 추정하지 말 것.\n\n"
+        f"[용건]\n{state.get('task','')}\n\n"
+        f"[화자 분리 대화 기록]\n{history_transcript}\n\n"
+        f"[녹음 전사 (참고용)]\n{transcript[:8000]}"
+    )
+    resp = openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def try_download_recording(recording_url: str, call_id: str) -> Path | None:
+    sid = os.getenv("TWILIO_ACCOUNT_SID")
+    token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not sid or not token:
+        return None
+
+    mp3_url = recording_url + ".mp3" if not recording_url.endswith(".mp3") else recording_url
+    out = OUT_DIR / f"{call_id}.mp3"
+    r = requests.get(mp3_url, auth=(sid, token), timeout=60)
+    if r.status_code >= 400:
+        return None
+    out.write_bytes(r.content)
+    return out
+
+
+def elevenlabs_tts_save(text: str, file_id: str) -> tuple[str | None, str | None]:
+    """Generate TTS via ElevenLabs and return (public_url, error_message)."""
+    api_key = os.getenv("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY)
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", ELEVENLABS_VOICE_ID)
+    if not api_key or not voice_id:
+        return None, "missing_api_key_or_voice_id"
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=mp3_44100_128"
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+    payload = {
+        "text": text,
+        "model_id": os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
+        "voice_settings": {
+            "stability": float(os.getenv("ELEVENLABS_STABILITY", "0.42")),
+            "similarity_boost": float(os.getenv("ELEVENLABS_SIMILARITY", "0.78")),
+            "style": float(os.getenv("ELEVENLABS_STYLE", "0.18")),
+            "use_speaker_boost": True,
+        },
+    }
+
+    t0 = time.time()
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
+        r.raise_for_status()
+        out_path = TTS_DIR / f"{file_id}.mp3"
+        out_path.write_bytes(r.content)
+        elapsed = time.time() - t0
+        logger.info("[TIMING] TTS %.2fs | file=%s | %d bytes", elapsed, file_id, len(r.content))
+        return f"{PUBLIC_BASE_URL}/static/tts/{file_id}.mp3", None
+    except Exception as exc:
+        elapsed = time.time() - t0
+        logger.error("[TIMING] TTS FAIL %.2fs | file=%s | %s", elapsed, file_id, exc)
+        return None, str(exc)
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"ok": "true"}
+
+
+@app.get("/twiml/start/{call_id}")
+def twiml_start(call_id: str) -> PlainTextResponse:
+    start_t0 = time.time()
+    logger.info("[START] call=%s", call_id)
+    state = load_state(call_id)
+    state["status"] = "in_progress"
+    save_state(call_id, state)
+
+    task_text = (state.get("task") or "전달드릴 용건이 있습니다.").strip()
+    task_text = re.sub(rf"^안녕하세요\.?\s*{re.escape(CALLER_NAME)}\s*님?\s*{re.escape(CALLER_TITLE)}입니다\.?\s*", "", task_text)
+    if not task_text:
+        task_text = "전달드릴 용건이 있습니다."
+
+    vr = VoiceResponse()
+    opening_text = f"안녕하세요. {CALLER_NAME}님 {CALLER_TITLE}입니다. {task_text}"
+    cache = state.get("tts_cache", {}) if isinstance(state.get("tts_cache"), dict) else {}
+    opening_tts_url = cache.get("opening")
+    if not opening_tts_url:
+        opening_tts_url, opening_tts_err = elevenlabs_tts_save(opening_text, f"{call_id}_opening")
+        if opening_tts_err:
+            state["opening_tts_error"] = opening_tts_err
+    state["opening_tts_provider"] = "elevenlabs" if opening_tts_url else "twilio_say"
+    save_state(call_id, state)
+
+    if opening_tts_url:
+        vr.play(opening_tts_url)
+    else:
+        vr.say(f"안녕하세요. {CALLER_NAME}님 {CALLER_TITLE}입니다.", language="ko-KR", voice="alice")
+        vr.pause(length=1)
+        vr.say(task_text, language="ko-KR", voice="alice")
+
+    gather = Gather(
+        input="speech",
+        action=f"{PUBLIC_BASE_URL}/twiml/turn/{call_id}",
+        method="POST",
+        speech_timeout="2",
+        timeout=4,
+        language="ko-KR",
+        hints="네, 아니요, 가능합니다, 안됩니다, 잠시만요, 여보세요",
+    )
+    vr.append(gather)
+    vr.redirect(f"{PUBLIC_BASE_URL}/twiml/turn/{call_id}", method="POST")
+    logger.info("[START END] call=%s | %.2fs", call_id, time.time() - start_t0)
+    return PlainTextResponse(str(vr), media_type="application/xml")
+
+
+@app.get("/twiml/turn/{call_id}")
+async def twiml_turn_get(call_id: str) -> PlainTextResponse:
+    # Twilio can hit this path via GET after Gather timeout depending on flow.
+    return await twiml_turn(call_id=call_id, SpeechResult="")
+
+
+@app.post("/twiml/turn/{call_id}")
+async def twiml_turn(call_id: str, SpeechResult: str = Form(default="")) -> PlainTextResponse:
+    turn_t0 = time.time()
+    state = load_state(call_id)
+
+    user_said = (SpeechResult or "").strip() or "(음성 인식 실패/무응답)"
+    logger.info("[TURN START] call=%s | user=%s", call_id, user_said[:60])
+    append_turn(state, "user", user_said)
+
+    ai_text = generate_reply(state, user_said)
+    speak_text, should_end = clean_for_tts(ai_text)
+    if should_end and not any(k in speak_text for k in ["좋은 하루", "좋은 저녁", "좋은 밤"]):
+        speak_text = f"{speak_text} {closing_by_local_time()}".strip()
+    append_turn(state, "assistant", speak_text)
+
+    turns = len(state.get("history", []))
+    if turns >= MAX_TURNS:
+        should_end = True
+        if not any(k in speak_text for k in ["전달하겠", "전달드리겠", "마치겠"]):
+            speak_text = speak_text + " 확인 감사합니다. 이만 통화를 마치겠습니다."
+        logger.info("call %s hit max turns (%d), ending", call_id, MAX_TURNS)
+
+    save_state(call_id, state)
+
+    vr = VoiceResponse()
+
+    # If ElevenLabs configured, prefer pre-generated cache to reduce turn latency.
+    cache = state.get("tts_cache", {}) if isinstance(state.get("tts_cache"), dict) else {}
+    tts_url = None
+    tts_err = None
+    if "말씀이 잘 안 들렸습니다" in speak_text:
+        tts_url = cache.get("fast_reprompt")
+    elif "오늘 좋은 하루 보내세요" in speak_text and "전달" in speak_text:
+        tts_url = cache.get("fast_end") or cache.get("fast_end_alt")
+
+    if not tts_url:
+        tts_url, tts_err = elevenlabs_tts_save(speak_text, f"{call_id}_{turns}")
+
+    state["last_tts_provider"] = "elevenlabs" if tts_url else "twilio_say"
+    if tts_err:
+        state["last_tts_error"] = tts_err
+    save_state(call_id, state)
+
+    if tts_url:
+        vr.play(tts_url)
+    else:
+        vr.say(speak_text, language="ko-KR", voice="alice")
+
+    if should_end:
+        # Avoid duplicated closing sentence if assistant already closed in the main response.
+        need_extra_closing = not any(k in speak_text for k in ["전달하겠", "전달드리겠", "좋은 하루", "좋은 저녁", "좋은 밤"])
+
+        if need_extra_closing:
+            daypart = closing_by_local_time()
+            closing_text = f"감사합니다. {CALLER_NAME}님께 바로 전달하겠습니다. {daypart}"
+            cache = state.get("tts_cache", {}) if isinstance(state.get("tts_cache"), dict) else {}
+            key = "fast_end"
+            closing_url = cache.get(key)
+            if not closing_url and tts_url:
+                closing_url, _ = elevenlabs_tts_save(closing_text, f"{call_id}_{key}")
+
+            if closing_url:
+                vr.play(closing_url)
+            else:
+                vr.say(closing_text, language="ko-KR", voice="alice")
+
+        vr.hangup()
+        state["status"] = "ended_by_agent"
+        save_state(call_id, state)
+    else:
+        gather = Gather(
+            input="speech",
+            action=f"{PUBLIC_BASE_URL}/twiml/turn/{call_id}",
+            method="POST",
+            speech_timeout="2",
+            timeout=4,
+            language="ko-KR",
+            hints="네, 아니요, 가능합니다, 안됩니다, 잠시만요, 여보세요",
+        )
+        vr.append(gather)
+        vr.redirect(f"{PUBLIC_BASE_URL}/twiml/turn/{call_id}", method="POST")
+
+    turn_elapsed = time.time() - turn_t0
+    logger.info("[TURN END] call=%s | total=%.2fs | turns=%d | end=%s",
+                call_id, turn_elapsed, turns, should_end)
+    return PlainTextResponse(str(vr), media_type="application/xml")
+
+
+@app.post("/callbacks/amd/{call_id}")
+async def amd_callback(call_id: str, request: Request) -> dict[str, Any]:
+    """Twilio Answering Machine Detection 콜백."""
+    form = await request.form()
+    state = load_state(call_id)
+    answered_by = str(form.get("AnsweredBy", "unknown"))
+    state["amd_result"] = answered_by
+    state["amd_raw"] = dict(form)
+    save_state(call_id, state)
+    logger.info("call %s AMD result: %s", call_id, answered_by)
+    return {"ok": True, "answered_by": answered_by}
+
+
+@app.post("/callbacks/status/{call_id}")
+async def status_callback(call_id: str, request: Request) -> dict[str, Any]:
+    form = await request.form()
+    state = load_state(call_id)
+    state["twilio_status"] = dict(form)
+    call_status = form.get("CallStatus")
+    if call_status:
+        state["status"] = str(call_status)
+    save_state(call_id, state)
+    logger.info("call %s status: %s", call_id, call_status)
+    return {"ok": True}
+
+
+@app.post("/callbacks/recording/{call_id}")
+async def recording_callback(call_id: str, request: Request) -> dict[str, Any]:
+    form = await request.form()
+    state = load_state(call_id)
+    rec = dict(form)
+    state["recording"] = rec
+    save_state(call_id, state)
+
+    recording_url = rec.get("RecordingUrl")
+    if not recording_url:
+        return {"ok": False, "reason": "no RecordingUrl"}
+
+    audio_path = try_download_recording(str(recording_url), call_id)
+    if not audio_path:
+        return {"ok": False, "reason": "download failed"}
+
+    state["recording_file"] = str(audio_path)
+    save_state(call_id, state)
+
+    try:
+        transcript = transcribe_recording(audio_path)
+        state["transcript"] = transcript
+
+        history_transcript = build_transcript_from_history(state)
+        state["history_transcript"] = history_transcript
+
+        summary = summarize_call(state, transcript)
+        state["report"] = summary
+        state["call_outcome"] = determine_call_outcome(state)
+        state["status"] = "reported"
+        save_state(call_id, state)
+
+        report_path = OUT_DIR / f"{call_id}.report.txt"
+        report_path.write_text(summary, encoding="utf-8")
+
+        transcript_path = OUT_DIR / f"{call_id}.transcript.txt"
+        transcript_path.write_text(
+            f"=== 화자 분리 대화 기록 ===\n{history_transcript}\n\n"
+            f"=== 녹음 전사 (원본) ===\n{transcript}",
+            encoding="utf-8",
+        )
+        logger.info("call %s reported: outcome=%s", call_id, state.get("call_outcome"))
+    except Exception as exc:
+        logger.error("call %s report error: %s", call_id, exc)
+        state["report_error"] = str(exc)
+        save_state(call_id, state)
+
+    return {"ok": True}
+
+
+def create_call_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+@app.post("/internal/create/{call_id}")
+async def internal_create(call_id: str, target_name: str = Form(default="상대방"), task: str = Form(default="")) -> dict[str, Any]:
+    st = load_state(call_id)
+    st["target_name"] = target_name
+    st["task"] = task
+
+    task_text = (task or "전달드릴 용건이 있습니다.").strip()
+    task_text = re.sub(rf"^안녕하세요\.?\s*{re.escape(CALLER_NAME)}\s*님?\s*{re.escape(CALLER_TITLE)}입니다\.?\s*", "", task_text)
+    if not task_text:
+        task_text = "전달드릴 용건이 있습니다."
+
+    cache: dict[str, str] = {}
+    opening_text = f"안녕하세요. {CALLER_NAME}님 {CALLER_TITLE}입니다. {task_text}"
+    for key, text in [
+        ("opening", opening_text),
+        ("prompt_open", "말씀해 주시면 이어서 안내드리겠습니다."),
+        ("prompt_next", "네, 계속 말씀해 주세요."),
+        ("fast_reprompt", "말씀이 잘 안 들렸습니다. 한 번만 다시 말씀해 주시겠어요?"),
+        ("fast_end", f"감사합니다. {CALLER_NAME}님께 바로 전달하겠습니다. 오늘 좋은 하루 보내세요."),
+        ("fast_end_alt", f"말씀 감사합니다. 전달받은 내용은 {CALLER_NAME}님께 바로 공유드리겠습니다. 오늘 좋은 하루 보내세요."),
+    ]:
+        u, _ = elevenlabs_tts_save(text, f"{call_id}_{key}")
+        if u:
+            cache[key] = u
+
+    st["tts_cache"] = cache
+    save_state(call_id, st)
+    return {"ok": True, "call_id": call_id}
+
+
+@app.get("/internal/report/{call_id}")
+def internal_report(call_id: str) -> dict[str, Any]:
+    st = load_state(call_id)
+    return st
+
+
+# ---------------------------------------------------------------------------
+# Realtime API (Phase 2) — Twilio Media Streams ↔ OpenAI Realtime
+# ---------------------------------------------------------------------------
+
+def build_realtime_system_prompt(state: dict[str, Any]) -> str:
+    """Realtime API용 system prompt. [END_CALL] 대신 end_call 함수를 사용한다."""
+    target = state.get("target_name", "상대방")
+    return (
+        f"당신은 {CALLER_NAME}님을 대신해 전화를 건 사람이다. 한국어로 실제 사람처럼 자연스럽게 통화한다.\n\n"
+        "## 말투\n"
+        "- 짧고 자연스럽게. 한 번에 1~2문장.\n"
+        "- 번호 목록, 긴 나열 금지.\n"
+        "- AI 티 나는 표현 금지.\n\n"
+        "## 자기소개\n"
+        "- 상대방이 누구인지, 용건이 무엇인지에 따라 자기소개 여부를 스스로 판단한다.\n"
+        "- 음식 주문, 가게 문의 등 일반 업무 전화: 자기소개 불필요. 바로 용건을 말한다.\n"
+        "  예) '안녕하세요. 빅맥 세트 1개 포장 주문하고 싶은데요.'\n"
+        f"- {CALLER_NAME}님의 지인, 동료, 거래처 등 인간관계가 있는 상대: '{CALLER_NAME}님 {CALLER_TITLE}입니다.'로 소개한다.\n\n"
+        "## 대화 흐름\n"
+        "- 상대방이 먼저 인사하면('여보세요', '안녕하세요, OO입니다') 그에 맞춰 자연스럽게 응답하며 용건을 전달한다.\n"
+        "- 상대방이 침묵하면 내가 먼저 말을 시작한다.\n"
+        "- 상대방의 질문에는 용건 범위 내에서 바로 답한다.\n"
+        "- 모르는 내용은 '확인 후 다시 연락드리겠습니다'라고 한다.\n"
+        "- 상대가 선택지를 주면 합리적으로 선택해서 답한다.\n\n"
+        "## 종료\n"
+        "- 용건이 완료되거나 상대가 거절/보류하면 자연스럽게 인사하고 end_call 함수를 호출한다.\n\n"
+        f"[상대] {target}\n"
+        f"[용건]\n{state.get('task', '') or '용건 미지정'}\n"
+    )
+
+
+@app.get("/twiml/start-realtime/{call_id}")
+def twiml_start_realtime(call_id: str) -> PlainTextResponse:
+    """Realtime 모드용 TwiML — <Connect><Stream>으로 양방향 오디오 스트리밍."""
+    logger.info("[REALTIME START] call=%s", call_id)
+    state = load_state(call_id)
+    state["status"] = "in_progress"
+    state["mode"] = "realtime"
+    save_state(call_id, state)
+
+    ws_url = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
+
+    vr = VoiceResponse()
+    connect = Connect()
+    connect.stream(url=f"{ws_url}/ws/media/{call_id}")
+    vr.append(connect)
+    return PlainTextResponse(str(vr), media_type="application/xml")
+
+
+@app.websocket("/ws/media/{call_id}")
+async def media_websocket(websocket: WebSocket, call_id: str) -> None:
+    """Twilio Media Stream ↔ OpenAI Realtime API 양방향 브릿지."""
+    await websocket.accept()
+    logger.info("[REALTIME WS] call=%s connected", call_id)
+
+    state = load_state(call_id)
+    stream_sid: str | None = None
+    call_ended = asyncio.Event()
+    other_party_spoke = asyncio.Event()
+    last_response_id: str | None = None  # 현재 진행 중인 응답 ID
+    mark_counter = 0  # 오디오 마크 카운터
+
+    async def _maybe_speak_first(oai_ws, ended_ev: asyncio.Event) -> None:
+        """상대방이 3초 내 말하지 않으면 AI가 먼저 시작한다."""
+        if ended_ev.is_set() or other_party_spoke.is_set():
+            return
+        logger.info("[REALTIME] silence 3s, AI speaks first call=%s", call_id)
+        try:
+            await oai_ws.send(json.dumps({
+                "type": "response.create",
+                "response": {"modalities": ["text", "audio"]},
+            }))
+        except Exception:
+            pass
+
+    openai_ws_url = f"{OPENAI_REALTIME_URL}?model={OPENAI_REALTIME_MODEL}"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+        "OpenAI-Beta": "realtime=v1",
+    }
+
+    try:
+        async with websockets.connect(openai_ws_url, additional_headers=headers) as openai_ws:
+            # --- Configure session ---
+            session_config = {
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text", "audio"],
+                    "instructions": build_realtime_system_prompt(state),
+                    "voice": OPENAI_REALTIME_VOICE,
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
+                    "input_audio_transcription": {"model": "whisper-1"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                    },
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "end_call",
+                            "description": "통화를 종료합니다. 용건이 완료/거절/보류되었을 때 호출합니다.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "reason": {
+                                        "type": "string",
+                                        "enum": ["completed", "rejected", "deferred"],
+                                        "description": "종료 사유",
+                                    }
+                                },
+                                "required": ["reason"],
+                            },
+                        }
+                    ],
+                },
+            }
+            await openai_ws.send(json.dumps(session_config))
+            logger.info("[REALTIME] session configured for call=%s", call_id)
+
+            # --- Twilio → OpenAI ---
+            async def twilio_to_openai() -> None:
+                nonlocal stream_sid
+                try:
+                    while not call_ended.is_set():
+                        raw = await websocket.receive_text()
+                        msg = json.loads(raw)
+                        event = msg.get("event")
+
+                        if event == "start":
+                            stream_sid = msg["start"]["streamSid"]
+                            logger.info("[REALTIME] twilio stream started sid=%s", stream_sid)
+                            asyncio.get_event_loop().call_later(
+                                3.0,
+                                lambda: asyncio.ensure_future(_maybe_speak_first(openai_ws, call_ended)),
+                            )
+
+                        elif event == "media":
+                            await openai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": msg["media"]["payload"],
+                            }))
+
+                        elif event == "mark":
+                            logger.debug("[REALTIME] mark received: %s", msg.get("mark", {}).get("name"))
+
+                        elif event == "stop":
+                            logger.info("[REALTIME] twilio stream stopped")
+                            call_ended.set()
+                            break
+                except WebSocketDisconnect:
+                    logger.info("[REALTIME] twilio WS disconnected")
+                    call_ended.set()
+
+            # --- OpenAI → Twilio ---
+            async def openai_to_twilio() -> None:
+                nonlocal last_response_id, mark_counter
+                try:
+                    async for raw in openai_ws:
+                        if call_ended.is_set():
+                            break
+                        msg = json.loads(raw)
+                        etype = msg.get("type", "")
+
+                        # Audio delta → Twilio
+                        if etype == "response.audio.delta":
+                            delta = msg.get("delta", "")
+                            if delta and stream_sid:
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": delta},
+                                })
+
+                        # Audio done → send mark to Twilio for sync
+                        elif etype == "response.audio.done":
+                            if stream_sid:
+                                mark_counter += 1
+                                await websocket.send_json({
+                                    "event": "mark",
+                                    "streamSid": stream_sid,
+                                    "mark": {"name": f"audio_done_{mark_counter}"},
+                                })
+
+                        # Track response ID
+                        elif etype == "response.created":
+                            last_response_id = msg.get("response", {}).get("id")
+
+                        # Assistant transcript done
+                        elif etype == "response.audio_transcript.done":
+                            text = msg.get("transcript", "").strip()
+                            if text:
+                                append_turn(state, "assistant", text)
+                                save_state(call_id, state)
+                                logger.info("[REALTIME] assistant: %s", text[:80])
+
+                        # Speech detected → clear Twilio buffer + cancel AI response
+                        elif etype == "input_audio_buffer.speech_started":
+                            other_party_spoke.set()
+                            logger.info("[REALTIME] speech detected, clearing Twilio buffer")
+                            if stream_sid:
+                                await websocket.send_json({
+                                    "event": "clear",
+                                    "streamSid": stream_sid,
+                                })
+                            # Cancel in-progress response to avoid overlap
+                            if last_response_id:
+                                await openai_ws.send(json.dumps({
+                                    "type": "response.cancel",
+                                }))
+
+                        # User transcript done
+                        elif etype == "conversation.item.input_audio_transcription.completed":
+                            text = msg.get("transcript", "").strip()
+                            if text:
+                                append_turn(state, "user", text)
+                                save_state(call_id, state)
+                                logger.info("[REALTIME] user: %s", text[:80])
+
+                        # Function call: end_call
+                        elif etype == "response.function_call_arguments.done":
+                            fn_name = msg.get("name", "")
+                            if fn_name == "end_call":
+                                args = json.loads(msg.get("arguments", "{}"))
+                                reason = args.get("reason", "completed")
+                                state["call_outcome"] = reason
+                                save_state(call_id, state)
+                                logger.info("[REALTIME] end_call reason=%s call=%s", reason, call_id)
+
+                                await openai_ws.send(json.dumps({
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "function_call_output",
+                                        "call_id": msg.get("call_id", ""),
+                                        "output": json.dumps({"status": "ok", "reason": reason}),
+                                    },
+                                }))
+                                await openai_ws.send(json.dumps({
+                                    "type": "response.create",
+                                    "response": {"modalities": ["text", "audio"]},
+                                }))
+
+                        # Response done — check if call should end
+                        elif etype == "response.done":
+                            resp = msg.get("response", {})
+                            output = resp.get("output", [])
+                            for item in output:
+                                if item.get("type") == "function_call" and item.get("name") == "end_call":
+                                    await asyncio.sleep(3)
+                                    call_ended.set()
+                                    break
+
+                        elif etype == "error":
+                            logger.error("[REALTIME] openai error: %s", msg.get("error"))
+
+                except websockets.exceptions.ConnectionClosed:
+                    logger.info("[REALTIME] openai WS closed")
+                    call_ended.set()
+
+            # Run both directions
+            await asyncio.gather(
+                twilio_to_openai(),
+                openai_to_twilio(),
+            )
+
+    except Exception as exc:
+        logger.error("[REALTIME] error call=%s: %s", call_id, exc)
+
+    # Finalize state
+    state = load_state(call_id)
+    state["status"] = "ended_by_agent"
+    if "call_outcome" not in state:
+        state["call_outcome"] = "completed"
+    save_state(call_id, state)
+    logger.info("[REALTIME END] call=%s turns=%d", call_id, len(state.get("history", [])))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("ai_call_server:app", host="0.0.0.0", port=5055, reload=False)

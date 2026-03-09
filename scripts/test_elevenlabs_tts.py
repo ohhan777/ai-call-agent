@@ -21,9 +21,19 @@ model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
 if not api_key or not voice_id:
     raise SystemExit("ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID 설정이 필요합니다.")
 
-caller_name = os.getenv("CALLER_NAME", "담당자")
+master_name = os.getenv("MASTER_NAME", "")
+master_title = os.getenv("MASTER_TITLE", "")
+caller_name = os.getenv("CALLER_NAME", "")
 caller_title = os.getenv("CALLER_TITLE", "비서")
-text = f"안녕하세요. {caller_name}님 {caller_title}입니다. 음성 합성 연결 테스트 중입니다."
+
+if master_name and master_title:
+    master_label = f"{master_name} {master_title}님"
+elif master_name:
+    master_label = f"{master_name}님"
+else:
+    master_label = "담당자님"
+caller_part = f"{caller_name} " if caller_name else ""
+text = f"안녕하세요. {master_label}의 {caller_part}{caller_title}입니다. 음성 합성 연결 테스트 중입니다."
 url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=mp3_44100_128"
 headers = {
     "xi-api-key": api_key,

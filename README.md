@@ -53,9 +53,12 @@ TWILIO_FROM_NUMBER=+1234567890
 TWILIO_PUBLIC_BASE_URL=https://your-ngrok-url.ngrok.io
 OPENAI_API_KEY=your_openai_key
 
-# 발신자 정보 (기본값: 담당자 / 비서)
-CALLER_NAME=홍길동
+# 발신자 정보 (소개 문구 조합에 사용)
+MASTER_NAME=오한
+MASTER_TITLE=박사
+CALLER_NAME=인공지능
 CALLER_TITLE=비서
+# → "안녕하세요. 오한 박사님의 인공지능 비서입니다"
 
 # 선택
 ELEVENLABS_API_KEY=your_elevenlabs_key

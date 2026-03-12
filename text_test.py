@@ -102,7 +102,7 @@ def run_text_session(task: str, target_name: str) -> None:
 
     print("=" * 60)
     print("AI 전화 비서 텍스트 테스트")
-    print(f"  용건: {task}")
+    print(f"  목표: {task}")
     print(f"  상대: {target_name}")
     print(f"  모델: {OPENAI_MODEL}")
     print("=" * 60)
@@ -148,7 +148,7 @@ def run_text_session(task: str, target_name: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI 전화 비서 텍스트 테스트")
-    parser.add_argument("--task", required=True, help="전달할 용건")
+    parser.add_argument("--task", required=True, help="달성할 목표")
     parser.add_argument("--target-name", default="상대방", help="상대 호칭 (기본: 상대방)")
     args = parser.parse_args()
 

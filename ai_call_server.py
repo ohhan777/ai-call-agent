@@ -90,13 +90,13 @@ def _is_person_target(target: str) -> bool:
 
 
 def _build_opening_text(target: str, task: str) -> str:
-    """TTS용 오프닝 문장 생성. 사람이면 자기소개 포함, 가게면 바로 용건."""
-    task_text = (task or "전달드릴 용건이 있습니다.").strip()
+    """TTS용 오프닝 문장 생성. 사람이면 자기소개 포함, 가게면 바로 본론."""
+    task_text = (task or "전달드릴 말씀이 있습니다.").strip()
     intro = _caller_intro()
     # 이미 자기소개가 포함된 경우 제거
     task_text = re.sub(rf"^안녕하세요\.?\s*{re.escape(intro)}\.?\s*", "", task_text)
     if not task_text:
-        task_text = "전달드릴 용건이 있습니다."
+        task_text = "전달드릴 말씀이 있습니다."
 
     if _is_person_target(target):
         return f"{target}님 안녕하세요. {intro}. {task_text}"
@@ -107,7 +107,7 @@ def _build_opening_text(target: str, task: str) -> str:
 MAX_TURNS = int(os.getenv("MAX_CALL_TURNS", "12"))
 
 # Realtime API config
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "coral")
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
@@ -162,12 +162,14 @@ def _common_prompt_body(target: str, end_method: str = "[END_CALL]") -> str:
 
     return (
         "## 역할\n"
-        f"- 나는 전화를 건 고객/요청자이다. 상대방({target})에게 용건을 전달하고 답변을 듣는다.\n"
+        f"- 나는 전화를 건 고객/요청자이다. 상대방({target})과 대화하여 주어진 목표를 달성한다.\n"
         "- 절대 상대방 역할(점원·직원·안내자)을 대신하지 않는다.\n"
         "- '준비해드리겠습니다', '확인해드리겠습니다', '더 필요하신 게 있으신가요' 등 서비스 제공자 표현 금지.\n"
         "- 주문·예약 전화에서는 고객으로서 요청하고, 상대의 안내를 따른다.\n\n"
         "## 말투\n"
-        "- 짧고 자연스럽게. 한 번에 1~2문장.\n"
+        "- 차분하고 친절하게. 한 번에 1~2문장.\n"
+        "- 상대방의 말을 경청하고, 배려깊게 응답한다.\n"
+        "- 상대가 시간이 필요해 보이면 '네, 천천히 하세요' 등으로 기다려준다.\n"
         "- 번호 목록·긴 나열 금지. AI 티 나는 표현 금지.\n"
         "- 시간은 고유어: 한시, 두시, 세시, 네시, 다섯시 … 열두시. (예: '세시' O, '3시'·'사시' X)\n"
         "- 날짜는 자연스럽게: '삼월 십일' O, '3/10' X\n\n"
@@ -175,15 +177,15 @@ def _common_prompt_body(target: str, end_method: str = "[END_CALL]") -> str:
         "- 상대가 사람(이름·직함: 김과장, 이부장, 박대리, 최박사, 정책임, 한선임, 윤연구원 등)\n"
         f"  → 반드시 자기소개: '{target}님 안녕하세요. {_caller_intro()}.'\n"
         "- 상대가 가게·업체·직원(맥도날드, 치킨집, 피자헛 등)\n"
-        "  → 자기소개 없이 바로 용건: '안녕하세요. 순살 치킨 반반 하나 배달 부탁드려요.'\n\n"
+        "  → 자기소개 없이 바로 본론: '안녕하세요. 순살 치킨 반반 하나 배달 부탁드려요.'\n\n"
         "## 대화 흐름\n"
-        "- 상대가 먼저 인사하면 그에 맞춰 응답하며 용건을 전달한다.\n"
+        "- 상대가 먼저 인사하면 그에 맞춰 응답하며 목표를 향해 대화를 이어간다.\n"
         "- 상대가 침묵하면 내가 먼저 말을 시작한다.\n"
-        "- 상대의 질문에는 용건 범위 내에서 바로 답한다.\n"
+        "- 상대의 질문에는 목표 범위 내에서 바로 답한다.\n"
         "- 모르는 내용은 '확인 후 다시 연락드리겠습니다'.\n"
         "- 상대가 선택지를 주면 합리적으로 선택해서 답한다.\n\n"
         "## 종료\n"
-        "- 먼저 끊지 않는다. 용건 전달 후 상대가 더 할 말이 없는지 기다린다.\n"
+        "- 먼저 끊지 않는다. 목표 달성 후 상대가 더 할 말이 없는지 기다린다.\n"
         "- 상대가 추가로 말하면 끊지 말고 대응한다.\n"
         + end_rule +
         "  낮: '감사합니다. 좋은 하루 되세요.'\n"
@@ -198,7 +200,7 @@ def build_system_prompt(state: dict[str, Any]) -> str:
         f"당신은 {_master_label()}을 대신해 전화를 건 사람이다. 실제 사람처럼 자연스럽게 통화한다.\n\n"
         + _common_prompt_body(target, end_method="[END_CALL]")
         + f"[상대] {target}\n"
-        f"[용건]\n{state.get('task','') or '용건 미지정'}\n"
+        f"[목표]\n{state.get('task','') or '목표 미지정'}\n"
     )
 
 
@@ -291,11 +293,11 @@ def summarize_call(state: dict[str, Any], transcript: str) -> str:
         f"{_master_label()}에게 보고하는 간결한 형식으로 한국어 요약해줘.\n\n"
         "형식:\n"
         f"## 통화 결과: {outcome}\n\n"
-        "### 목표 달성 현황\n- (용건의 각 목표별 달성 여부)\n\n"
+        "### 목표 달성 현황\n- (각 목표별 달성 여부)\n\n"
         "### 상대방 핵심 답변\n- (상대방이 말한 내용만, 비서 발화 제외)\n\n"
         "### 후속 조치\n- (필요한 다음 행동)\n\n"
         "불확실한 내용은 추정하지 말 것.\n\n"
-        f"[용건]\n{state.get('task','')}\n\n"
+        f"[목표]\n{state.get('task','')}\n\n"
         f"[화자 분리 대화 기록]\n{history_transcript}\n\n"
         f"[녹음 전사 (참고용)]\n{transcript[:8000]}"
     )
@@ -624,7 +626,7 @@ def build_realtime_system_prompt(state: dict[str, Any]) -> str:
         f"당신은 {_master_label()}을 대신해 전화를 건 사람이다. 한국어로 실제 사람처럼 자연스럽게 통화한다.\n\n"
         + _common_prompt_body(target, end_method="end_call")
         + f"[상대] {target}\n"
-        f"[용건]\n{state.get('task', '') or '용건 미지정'}\n"
+        f"[목표]\n{state.get('task', '') or '목표 미지정'}\n"
     )
 
 
@@ -700,7 +702,7 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
                         {
                             "type": "function",
                             "name": "end_call",
-                            "description": "통화를 종료합니다. 용건이 완료/거절/보류되었을 때 호출합니다.",
+                            "description": "통화를 종료합니다. 목표가 달성/거절/보류되었을 때 호출합니다.",
                             "parameters": {
                                 "type": "object",
                                 "properties": {

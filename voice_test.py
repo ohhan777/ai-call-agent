@@ -25,7 +25,8 @@ import pyaudio
 import websockets
 from dotenv import load_dotenv
 
-load_dotenv(os.path.expanduser("~/.openclaw/.env"), override=False)
+load_dotenv()
+load_dotenv(os.path.expanduser("~/.openclaw/.env"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +37,7 @@ logger = logging.getLogger("voice_test")
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-mini")
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5")
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "coral")
 OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
@@ -78,7 +79,7 @@ async def run_voice_session(task: str, target_name: str) -> None:
 
     print("=" * 60)
     print("AI 전화 비서 음성 테스트")
-    print(f"  용건: {task}")
+    print(f"  목표: {task}")
     print(f"  상대: {target_name}")
     print(f"  모델: {OPENAI_REALTIME_MODEL}")
     print(f"  음성: {OPENAI_REALTIME_VOICE}")
@@ -137,7 +138,7 @@ async def run_voice_session(task: str, target_name: str) -> None:
                         {
                             "type": "function",
                             "name": "end_call",
-                            "description": "통화를 종료합니다. 용건이 완료/거절/보류되었을 때 호출합니다.",
+                            "description": "통화를 종료합니다. 목표가 달성/거절/보류되었을 때 호출합니다.",
                             "parameters": {
                                 "type": "object",
                                 "properties": {
@@ -305,7 +306,7 @@ async def run_voice_session(task: str, target_name: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI 전화 비서 음성 테스트")
-    parser.add_argument("--task", required=True, help="전달할 용건")
+    parser.add_argument("--task", required=True, help="달성할 목표")
     parser.add_argument("--target-name", default="상대방", help="상대 호칭 (기본: 상대방)")
     args = parser.parse_args()
 

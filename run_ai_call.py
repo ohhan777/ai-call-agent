@@ -95,7 +95,7 @@ def wait_for_result(base_url: str, call_id: str, timeout: int = 120) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI 전화 대리 통화 시작")
     parser.add_argument("--to", required=True, help="수신번호 (E.164)")
-    parser.add_argument("--task", required=True, help="전달할 용건")
+    parser.add_argument("--task", required=True, help="달성할 목표")
     parser.add_argument("--target-name", default="상대방", help="상대 호칭")
     parser.add_argument("--base-url", default=os.getenv("TWILIO_PUBLIC_BASE_URL", ""), help="공개 서버 URL")
     parser.add_argument("--from-number", default=os.getenv("TWILIO_FROM_NUMBER", ""), help="Twilio 발신번호")

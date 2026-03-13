@@ -130,9 +130,9 @@ async def run_voice_session(task: str, target_name: str) -> None:
                     "input_audio_transcription": {"model": "whisper-1"},
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
+                        "threshold": 0.55,
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
+                        "silence_duration_ms": 400,
                     },
                     "tools": [
                         {
@@ -159,7 +159,7 @@ async def run_voice_session(task: str, target_name: str) -> None:
 
             # --- 3-second silence: AI speaks first ---
             async def maybe_speak_first() -> None:
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(1.5)
                 if call_ended.is_set():
                     return
                 logger.info("3초 침묵, AI가 먼저 말을 시작합니다")

@@ -178,6 +178,8 @@ def _common_prompt_body(target: str, end_method: str = "[END_CALL]") -> str:
         "- 상대방의 말에 자연스럽게 반응한다 (예: '아 네', '그렇군요', '알겠습니다').\n"
         "- '도움이 필요하시면 언제든지 말씀해 주세요' 같은 고객센터식 멘트 절대 금지.\n"
         "- 상대가 시간이 필요하거나 '잠깐', '멈춰봐' 등을 말하면 조용히 기다린다. 말을 끊거나 추가 설명하지 않는다.\n"
+        "- 상대와 말이 겹치면 당황하지 말고 하던 말을 간결하게 마무리한 뒤 상대의 말을 듣는다.\n"
+        "- 짧은 추임새(네, 아, 응, 여보세요)에는 말을 멈추지 않고 이어간다.\n"
         "- 번호 목록·긴 나열 금지. AI 티 나는 표현 금지.\n"
         "- 시간은 고유어: 한시, 두시, 세시, 네시, 다섯시 … 열두시. (예: '세시' O, '3시'·'사시' X)\n"
         "- 날짜는 자연스럽게: '삼월 십일' O, '3/10' X\n\n"
@@ -673,12 +675,14 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
     other_party_spoke = asyncio.Event()
     last_response_id: str | None = None  # 현재 진행 중인 응답 ID
     mark_counter = 0  # 오디오 마크 카운터
+    is_ai_speaking = False  # AI가 현재 오디오 출력 중인지
+    ai_audio_chunks_sent = 0  # 현재 응답에서 보낸 오디오 청크 수
 
     async def _maybe_speak_first(oai_ws, ended_ev: asyncio.Event) -> None:
-        """상대방이 3초 내 말하지 않으면 AI가 먼저 시작한다."""
+        """상대방이 1.5초 내 말하지 않으면 AI가 먼저 시작한다."""
         if ended_ev.is_set() or other_party_spoke.is_set():
             return
-        logger.info("[REALTIME] silence 3s, AI speaks first call=%s", call_id)
+        logger.info("[REALTIME] silence 1.5s, AI speaks first call=%s", call_id)
         try:
             await oai_ws.send(json.dumps({
                 "type": "response.create",
@@ -707,9 +711,9 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
                     "input_audio_transcription": {"model": "whisper-1"},
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
+                        "threshold": 0.55,
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
+                        "silence_duration_ms": 400,
                     },
                     "tools": [
                         {
@@ -747,7 +751,7 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
                             stream_sid = msg["start"]["streamSid"]
                             logger.info("[REALTIME] twilio stream started sid=%s", stream_sid)
                             asyncio.get_event_loop().call_later(
-                                3.0,
+                                1.5,
                                 lambda: asyncio.ensure_future(_maybe_speak_first(openai_ws, call_ended)),
                             )
 
@@ -770,7 +774,7 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
 
             # --- OpenAI → Twilio ---
             async def openai_to_twilio() -> None:
-                nonlocal last_response_id, mark_counter
+                nonlocal last_response_id, mark_counter, is_ai_speaking, ai_audio_chunks_sent
                 try:
                     async for raw in openai_ws:
                         if call_ended.is_set():
@@ -782,6 +786,8 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
                         if etype == "response.audio.delta":
                             delta = msg.get("delta", "")
                             if delta and stream_sid:
+                                is_ai_speaking = True
+                                ai_audio_chunks_sent += 1
                                 await websocket.send_json({
                                     "event": "media",
                                     "streamSid": stream_sid,
@@ -790,6 +796,8 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
 
                         # Audio done → send mark to Twilio for sync
                         elif etype == "response.audio.done":
+                            is_ai_speaking = False
+                            ai_audio_chunks_sent = 0
                             if stream_sid:
                                 mark_counter += 1
                                 await websocket.send_json({
@@ -810,20 +818,30 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
                                 save_state(call_id, state)
                                 logger.info("[REALTIME] assistant: %s", text[:80])
 
-                        # Speech detected → clear Twilio buffer + cancel AI response
+                        # Speech detected → conditionally handle interruption
                         elif etype == "input_audio_buffer.speech_started":
                             other_party_spoke.set()
-                            logger.info("[REALTIME] speech detected, clearing Twilio buffer")
-                            if stream_sid:
-                                await websocket.send_json({
-                                    "event": "clear",
-                                    "streamSid": stream_sid,
-                                })
-                            # Cancel in-progress response to avoid overlap
-                            if last_response_id:
-                                await openai_ws.send(json.dumps({
-                                    "type": "response.cancel",
-                                }))
+                            if is_ai_speaking and ai_audio_chunks_sent >= 40:
+                                # AI가 이미 충분히 말했으면 (~2초+) 끊지 않고 마무리
+                                logger.info(
+                                    "[REALTIME] speech overlap — AI nearly done (%d chunks), continuing",
+                                    ai_audio_chunks_sent,
+                                )
+                            else:
+                                # AI가 아직 별로 안 말했거나 말하고 있지 않으면 양보
+                                logger.info(
+                                    "[REALTIME] speech detected — AI yielding (speaking=%s, chunks=%d)",
+                                    is_ai_speaking, ai_audio_chunks_sent,
+                                )
+                                if stream_sid:
+                                    await websocket.send_json({
+                                        "event": "clear",
+                                        "streamSid": stream_sid,
+                                    })
+                                if last_response_id:
+                                    await openai_ws.send(json.dumps({
+                                        "type": "response.cancel",
+                                    }))
 
                         # User transcript done
                         elif etype == "conversation.item.input_audio_transcription.completed":

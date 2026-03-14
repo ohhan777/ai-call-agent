@@ -166,6 +166,11 @@ def _common_prompt_body(target: str, end_method: str = "[END_CALL]") -> str:
     return (
         "## 역할\n"
         f"- 나는 {master}의 비서이다. {master}을 대신해 {target}에게 전화를 걸었다.\n"
+        f"- 목표에 '{target}에게 전해줘/말해줘/물어봐줘' 등이 있으면, 지금 통화 중인 {target}이 바로 그 수신자이다.\n"
+        f"  → {master}의 말을 직접 전한다. 예: '{master}이 사랑한다고 하셨어요.'\n"
+        f"  → 제3자에게 전달하겠다고 하거나, {target}에게 다시 확인을 구하지 않는다.\n"
+        f"  → 목표에 적힌 호칭(딸, 아들, 어머니 등)을 {target}에게 반복하지 않는다. 이미 본인에게 말하고 있기 때문이다.\n"
+        f"    예: 목표가 '딸에게 사랑한다고 전해줘'이면 → '사랑한다고 하셨어요' (O) / '따님께 사랑한다고 전해달라 하셨어요' (X)\n"
         f"- 내가 수집한 정보는 {master}에게 전달하는 것이다. 상대방에게 전달하는 것이 아니다.\n"
         f"- 상대방이 '{master}에게 전해달라'고 하면 '네, {master}께 전달드리겠습니다'로 답한다.\n"
         "- 절대 상대방 역할(점원·직원·안내자)을 대신하지 않는다.\n"
@@ -189,7 +194,9 @@ def _common_prompt_body(target: str, end_method: str = "[END_CALL]") -> str:
         "- 상대가 가게·업체·직원(맥도날드, 치킨집, 피자헛 등)\n"
         "  → 자기소개 없이 바로 본론: '안녕하세요. 순살 치킨 반반 하나 배달 부탁드려요.'\n\n"
         "## 대화 흐름\n"
-        "- 첫 인사에서는 자기소개만 하고, 용건은 상대가 응답한 뒤 하나씩 꺼낸다.\n"
+        "- 첫 인사에서는 자기소개와 함께 통화 목적을 간략히 밝히거나, 상대방이 통화 가능한지 물어본다.\n"
+        "  예: '안녕하세요. 오한 박사님의 비서입니다. 잠깐 통화 괜찮으신가요?' 또는 '...비서입니다. 일정 확인차 연락드렸습니다.'\n"
+        "- 자기소개만 하고 침묵하며 기다리지 않는다.\n"
         "- 목표에 여러 용건이 있으면 하나를 먼저 물어보고, 답을 받은 뒤 다음 용건으로 넘어간다.\n"
         "- 상대가 먼저 인사하거나 말을 걸면 그에 맞춰 자연스럽게 응답한 뒤 용건으로 넘어간다.\n"
         "- 상대가 침묵하면 내가 먼저 말을 시작한다.\n"
@@ -677,6 +684,7 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
     mark_counter = 0  # 오디오 마크 카운터
     is_ai_speaking = False  # AI가 현재 오디오 출력 중인지
     ai_audio_chunks_sent = 0  # 현재 응답에서 보낸 오디오 청크 수
+    end_call_pending = False  # end_call 함수 호출 후 closing response 대기 중
 
     async def _maybe_speak_first(oai_ws, ended_ev: asyncio.Event) -> None:
         """상대방이 1.5초 내 말하지 않으면 AI가 먼저 시작한다."""
@@ -774,7 +782,7 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
 
             # --- OpenAI → Twilio ---
             async def openai_to_twilio() -> None:
-                nonlocal last_response_id, mark_counter, is_ai_speaking, ai_audio_chunks_sent
+                nonlocal last_response_id, mark_counter, is_ai_speaking, ai_audio_chunks_sent, end_call_pending
                 try:
                     async for raw in openai_ws:
                         if call_ended.is_set():
@@ -858,6 +866,7 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
                                 args = json.loads(msg.get("arguments", "{}"))
                                 reason = args.get("reason", "completed")
                                 state["call_outcome"] = reason
+                                end_call_pending = True
                                 save_state(call_id, state)
                                 logger.info("[REALTIME] end_call reason=%s call=%s", reason, call_id)
 
@@ -878,11 +887,18 @@ async def media_websocket(websocket: WebSocket, call_id: str) -> None:
                         elif etype == "response.done":
                             resp = msg.get("response", {})
                             output = resp.get("output", [])
-                            for item in output:
-                                if item.get("type") == "function_call" and item.get("name") == "end_call":
-                                    await asyncio.sleep(3)
-                                    call_ended.set()
-                                    break
+                            has_end_call = any(
+                                item.get("type") == "function_call" and item.get("name") == "end_call"
+                                for item in output
+                            )
+                            if has_end_call:
+                                # end_call 함수가 포함된 응답 완료 — closing response를 기다린다
+                                logger.info("[REALTIME] end_call response done, waiting for closing response")
+                            elif end_call_pending:
+                                # closing response 완료 — 오디오 재생 후 종료
+                                logger.info("[REALTIME] closing response done, ending call")
+                                await asyncio.sleep(1)
+                                call_ended.set()
 
                         elif etype == "error":
                             logger.error("[REALTIME] openai error: %s", msg.get("error"))

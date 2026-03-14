@@ -196,6 +196,7 @@ async def run_voice_session(task: str, target_name: str) -> None:
 
             # --- API → Speaker ---
             async def api_to_speaker() -> None:
+                end_call_pending = False
                 try:
                     async for raw in ws:
                         if call_ended.is_set():
@@ -238,6 +239,7 @@ async def run_voice_session(task: str, target_name: str) -> None:
                                 args = json.loads(msg.get("arguments", "{}"))
                                 reason = args.get("reason", "completed")
                                 state["call_outcome"] = reason
+                                end_call_pending = True
                                 logger.info("end_call 호출: reason=%s", reason)
 
                                 # Send function result and request closing response
@@ -257,12 +259,17 @@ async def run_voice_session(task: str, target_name: str) -> None:
                         # Response done — end call if end_call was invoked
                         elif etype == "response.done":
                             resp = msg.get("response", {})
-                            for item in resp.get("output", []):
-                                if item.get("type") == "function_call" and item.get("name") == "end_call":
-                                    # Wait for closing audio to finish playing
-                                    await asyncio.sleep(2)
-                                    call_ended.set()
-                                    break
+                            output = resp.get("output", [])
+                            has_end_call = any(
+                                item.get("type") == "function_call" and item.get("name") == "end_call"
+                                for item in output
+                            )
+                            if has_end_call:
+                                logger.info("end_call 함수 응답 완료, 마지막 인사 대기 중...")
+                            elif end_call_pending:
+                                logger.info("마지막 인사 완료, 통화 종료")
+                                await asyncio.sleep(1) # wait for audio to finish streaming
+                                call_ended.set()
 
                         # Session created confirmation
                         elif etype == "session.created":
